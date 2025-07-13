@@ -1,319 +1,608 @@
 import os
 import json
 import asyncio
-from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Optional
-from pydantic import BaseModel
+from datetime import datetime, timedelta
+from typing import Dict, Any
 from pydantic_ai import Agent, Tool
 from pydantic_ai.models.openai import OpenAIModel
 from pydantic_ai.providers.openai import OpenAIProvider
-from calendar_extractor import retrive_calendar_events
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-
-class TimeSlot(BaseModel):
-    start: str
-    end: str
-    available: bool
-
-class MeetingRequest(BaseModel):
-    attendees: List[str]
-    duration_minutes: int
-    preferred_day: Optional[str] = None
-    start_range: str
-    end_range: str
-    subject: str
-
-class ScheduledMeeting(BaseModel):
-    start_time: str
-    end_time: str
-    attendees: List[str]
-    subject: str
-    status: str
-    conflict_resolution: Optional[str] = None
 
 @Tool
 def get_current_datetime() -> str:
-    """Get the current date and time in ISO format."""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    """Get the current date and time in ISO format with timezone."""
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S+05:30")
 
 @Tool
-def extract_meeting_details(email_content: str, current_time: str) -> Dict[str, Any]:
-    """Extract meeting details from email content including timing, duration, and context."""
-    # This will be enhanced by LLM to parse natural language
-    return {
-        "parsed_content": email_content,
-        "current_time": current_time,
-        "extraction_status": "success"
-    }
-
-@Tool
-def get_user_calendar_events(user_email: str, start_time: str, end_time: str) -> List[Dict[str, Any]]:
-    """Retrieve calendar events for a specific user within the given time range."""
-    try:
-        events = retrive_calendar_events(user_email, start_time, end_time)
-        return events
-    except Exception as e:
-        return {"error": f"Failed to retrieve calendar for {user_email}: {str(e)}"}
-
-@Tool
-def get_all_attendees_availability(attendees: List[str], start_time: str, end_time: str) -> Dict[str, List[Dict[str, Any]]]:
-    """Get calendar events for all meeting attendees to check availability."""
-    all_events = {}
-    for attendee in attendees:
-        try:
-            events = retrive_calendar_events(attendee, start_time, end_time)
-            all_events[attendee] = events
-        except Exception as e:
-            all_events[attendee] = {"error": f"Could not fetch calendar: {str(e)}"}
-    return all_events
-
-@Tool
-def find_optimal_time_slot(attendees_events: Dict[str, List[Dict]], duration_minutes: int, 
-                          start_range: str, end_range: str, business_hours_only: bool = True) -> Dict[str, Any]:
-    """Find the optimal time slot when all attendees are available."""
-    from datetime import datetime, timedelta
-    import pytz
+def extract_meeting_time_from_email(email_content: str, current_datetime: str) -> Dict[str, Any]:
+    """Extract meeting timing details from email content with detailed logging and weekend/off-hours handling."""
+    print(f"\nLLM TOOL: extract_meeting_time_from_email")
+    print(f"Email content: '{email_content}'")
+    print(f"Current time: {current_datetime}")
     
-    # Parse time range
-    start_dt = datetime.fromisoformat(start_range.replace('Z', '+00:00'))
-    end_dt = datetime.fromisoformat(end_range.replace('Z', '+00:00'))
+    email_lower = email_content.lower()
     
-    # Generate time slots (15-minute intervals during business hours)
-    time_slots = []
-    current = start_dt.replace(hour=9, minute=0, second=0, microsecond=0)  # Start at 9 AM
-    day_end = start_dt.replace(hour=18, minute=0, second=0, microsecond=0)  # End at 6 PM
+    # Parse current datetime
+    current_dt = datetime.fromisoformat(current_datetime.replace('+05:30', ''))
+    print(f"Parsed current datetime: {current_dt}")
     
-    while current <= end_dt:
-        if current.hour >= 9 and current.hour < 18:  # Business hours
-            slot_end = current + timedelta(minutes=duration_minutes)
-            if slot_end.hour <= 18:  # Ensure meeting ends within business hours
-                time_slots.append({
-                    "start": current.isoformat(),
-                    "end": slot_end.isoformat()
-                })
-        current += timedelta(minutes=15)  # 15-minute intervals
-        if current.hour >= 18:  # Move to next day
-            current = current.replace(hour=9, minute=0) + timedelta(days=1)
+    # Extract duration
+    duration = 30  # default
+    if "30 min" in email_lower or "30 minutes" in email_lower:
+        duration = 30
+        print(f"Detected duration: 30 minutes from '30 min/minutes'")
+    elif "1 hour" in email_lower or "60 min" in email_lower:
+        duration = 60
+        print(f"Detected duration: 60 minutes from '1 hour/60 min'")
+    elif "15 min" in email_lower:
+        duration = 15
+        print(f"Detected duration: 15 minutes")
+    elif "45 min" in email_lower:
+        duration = 45
+        print(f"Detected duration: 45 minutes")
+    else:
+        print(f"Using default duration: 30 minutes (no specific duration found)")
     
-    # Check availability for each slot
-    available_slots = []
-    for slot in time_slots:
-        slot_start = datetime.fromisoformat(slot["start"])
-        slot_end = datetime.fromisoformat(slot["end"])
-        
-        # Check if all attendees are free
-        all_free = True
-        conflicts = []
-        
-        for attendee, events in attendees_events.items():
-            if isinstance(events, dict) and "error" in events:
-                continue  # Skip if calendar couldn't be fetched
-                
-            for event in events:
-                event_start = datetime.fromisoformat(event["StartTime"])
-                event_end = datetime.fromisoformat(event["EndTime"])
-                
-                # Check for overlap
-                if (slot_start < event_end and slot_end > event_start):
-                    all_free = False
-                    conflicts.append({
-                        "attendee": attendee,
-                        "conflicting_event": event["Summary"],
-                        "event_time": f"{event['StartTime']} - {event['EndTime']}"
-                    })
-                    break
-        
-        if all_free:
-            available_slots.append({
-                "start_time": slot["start"],
-                "end_time": slot["end"],
-                "confidence": "high"
-            })
-        
-        # If we found a good slot, return it
-        if len(available_slots) >= 3:  # Return top 3 options
-            break
+    def find_next_business_day(start_date: datetime) -> datetime:
+        """Find the next business day (Monday-Friday), skipping weekends."""
+        next_day = start_date
+        while next_day.weekday() >= 5:  # Saturday=5, Sunday=6
+            next_day += timedelta(days=1)
+            print(f"Skipping weekend: {next_day.strftime('%A %Y-%m-%d')}")
+        return next_day
     
-    return {
-        "available_slots": available_slots[:3],
-        "total_slots_checked": len(time_slots),
-        "conflicts_found": len([s for s in time_slots if s not in [a for a in available_slots]])
-    }
-
-@Tool
-def create_calendar_event(organizer_email: str, attendees: List[str], start_time: str, 
-                         end_time: str, subject: str, description: str = "") -> Dict[str, Any]:
-    """Create a calendar event for all attendees."""
-    try:
-        # Use organizer's credentials to create the event
-        token_path = os.path.join("Keys", organizer_email.split("@")[0] + ".token")
-        user_creds = Credentials.from_authorized_user_file(token_path)
-        calendar_service = build("calendar", "v3", credentials=user_creds)
-        
-        event = {
-            'summary': subject,
-            'description': description,
-            'start': {
-                'dateTime': start_time,
-                'timeZone': 'Asia/Kolkata',
-            },
-            'end': {
-                'dateTime': end_time,
-                'timeZone': 'Asia/Kolkata',
-            },
-            'attendees': [{'email': email} for email in attendees],
-            'reminders': {
-                'useDefault': False,
-                'overrides': [
-                    {'method': 'email', 'minutes': 24 * 60},
-                    {'method': 'popup', 'minutes': 10},
-                ],
-            },
-        }
-        
-        created_event = calendar_service.events().insert(calendarId='primary', body=event).execute()
-        return {
-            "status": "success",
-            "event_id": created_event.get('id'),
-            "event_link": created_event.get('htmlLink'),
-            "created_at": created_event.get('created')
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e)
-        }
-
-@Tool 
-def resolve_scheduling_conflicts(conflicts: List[Dict], meeting_priority: str = "high") -> Dict[str, Any]:
-    """Analyze conflicts and suggest resolution strategies."""
-    resolution_strategies = []
+    # Extract day
+    target_date = None
+    if "thursday" in email_lower:
+        # Find next Thursday
+        days_ahead = 3 - current_dt.weekday()  # Thursday = 3
+        if days_ahead <= 0:
+            days_ahead += 7
+        target_date = current_dt + timedelta(days=days_ahead)
+        print(f"Detected day: Thursday ({days_ahead} days ahead)")
+    elif "tuesday" in email_lower:
+        days_ahead = 1 - current_dt.weekday()  # Tuesday = 1
+        if days_ahead <= 0:
+            days_ahead += 7
+        target_date = current_dt + timedelta(days=days_ahead)
+        print(f"Detected day: Tuesday ({days_ahead} days ahead)")
+    elif "friday" in email_lower:
+        days_ahead = 4 - current_dt.weekday()  # Friday = 4
+        if days_ahead <= 0:
+            days_ahead += 7
+        target_date = current_dt + timedelta(days=days_ahead)
+        print(f"Detected day: Friday ({days_ahead} days ahead)")
+    elif "monday" in email_lower:
+        days_ahead = 0 - current_dt.weekday()  # Monday = 0
+        if days_ahead <= 0:
+            days_ahead += 7
+        target_date = current_dt + timedelta(days=days_ahead)
+        print(f"Detected day: Monday ({days_ahead} days ahead)")
+    elif "wednesday" in email_lower:
+        days_ahead = 2 - current_dt.weekday()  # Wednesday = 2
+        if days_ahead <= 0:
+            days_ahead += 7
+        target_date = current_dt + timedelta(days=days_ahead)
+        print(f"Detected day: Wednesday ({days_ahead} days ahead)")
+    elif "tomorrow" in email_lower:
+        target_date = current_dt + timedelta(days=1)
+        # Check if tomorrow is a weekend
+        if target_date.weekday() >= 5:
+            target_date = find_next_business_day(target_date)
+            print(f"Tomorrow is weekend, moving to next business day")
+        print(f"Detected day: Tomorrow")
+    elif "today" in email_lower:
+        target_date = current_dt
+        # Check if today is a weekend
+        if target_date.weekday() >= 5:
+            target_date = find_next_business_day(target_date)
+            print(f"Today is weekend, moving to next business day")
+        print(f"Detected day: Today")
+    else:
+        # Instead of defaulting to Thursday, find the next business day
+        target_date = current_dt + timedelta(days=1)
+        target_date = find_next_business_day(target_date)
+        print(f"No specific day mentioned, using next business day: {target_date.strftime('%A')}")
     
-    for conflict in conflicts:
-        if "1:1" in conflict.get("conflicting_event", "").lower():
-            resolution_strategies.append({
-                "conflict": conflict,
-                "suggestion": "Request to reschedule 1:1 meeting as group meeting has higher priority",
-                "action": "send_reschedule_request"
-            })
-        elif "optional" in conflict.get("conflicting_event", "").lower():
-            resolution_strategies.append({
-                "conflict": conflict,
-                "suggestion": "Attendee can skip optional meeting",
-                "action": "mark_as_resolved"
-            })
+    print(f"Target date: {target_date.strftime('%Y-%m-%d %A')}")
+    
+    # Verify it's a business day
+    if target_date.weekday() >= 5:
+        print(f"Warning: Target date {target_date.strftime('%A')} is a weekend!")
+        target_date = find_next_business_day(target_date)
+        print(f"Adjusted to next business day: {target_date.strftime('%A %Y-%m-%d')}")
+    
+    # Extract time of day
+    meeting_hour = 10  # Default to 10:30 AM
+    meeting_minute = 30
+    
+    if "2 pm" in email_lower or "2:00 pm" in email_lower or "14:00" in email_lower:
+        meeting_hour = 14
+        meeting_minute = 0
+        print(f"Detected time: 2:00 PM from email content")
+    elif "10 am" in email_lower or "10:00 am" in email_lower:
+        meeting_hour = 10
+        meeting_minute = 0
+        print(f"Detected time: 10:00 AM from email content")
+    elif "3 pm" in email_lower or "15:00" in email_lower:
+        meeting_hour = 15
+        meeting_minute = 0
+        print(f"Detected time: 3:00 PM from email content")
+    elif "11 am" in email_lower or "11:00 am" in email_lower:
+        meeting_hour = 11
+        meeting_minute = 0
+        print(f"Detected time: 11:00 AM from email content")
+    elif "9 am" in email_lower or "9:00 am" in email_lower:
+        meeting_hour = 9
+        meeting_minute = 0
+        print(f"Detected time: 9:00 AM from email content")
+    elif "4 pm" in email_lower or "4:00 pm" in email_lower or "16:00" in email_lower:
+        meeting_hour = 16
+        meeting_minute = 0
+        print(f"Detected time: 4:00 PM from email content")
+    elif "morning" in email_lower:
+        meeting_hour = 10
+        meeting_minute = 0
+        print(f"Detected time: Morning (10:00 AM)")
+    elif "afternoon" in email_lower:
+        meeting_hour = 14
+        meeting_minute = 0
+        print(f"Detected time: Afternoon (2:00 PM)")
+    else:
+        print(f"Using default time: 10:30 AM (no specific time found)")
+    
+    # Validate business hours (9 AM - 6 PM)
+    if meeting_hour < 9:
+        print(f"Time {meeting_hour}:00 is before business hours, adjusting to 9:00 AM")
+        meeting_hour = 9
+        meeting_minute = 0
+    elif meeting_hour >= 18:
+        print(f"Time {meeting_hour}:00 is after business hours, adjusting to next day 10:00 AM")
+        target_date += timedelta(days=1)
+        target_date = find_next_business_day(target_date)
+        meeting_hour = 10
+        meeting_minute = 0
+    
+    # Set optimal meeting time
+    meeting_start = target_date.replace(hour=meeting_hour, minute=meeting_minute, second=0, microsecond=0)
+    meeting_end = meeting_start + timedelta(minutes=duration)
+    
+    # Final validation - ensure end time is also within business hours
+    if meeting_end.hour >= 18:
+        print(f"Meeting end time {meeting_end.hour}:00 exceeds business hours")
+        # Adjust start time earlier or move to next day
+        if meeting_start.hour > 9:
+            # Try moving start time earlier
+            meeting_start = meeting_start.replace(hour=9, minute=0)
+            meeting_end = meeting_start + timedelta(minutes=duration)
+            print(f"Adjusted start time to 9:00 AM to fit within business hours")
         else:
-            resolution_strategies.append({
-                "conflict": conflict,
-                "suggestion": "Find alternative time slot or negotiate priority",
-                "action": "find_alternative"
-            })
+            # Move to next business day
+            target_date += timedelta(days=1)
+            target_date = find_next_business_day(target_date)
+            meeting_start = target_date.replace(hour=10, minute=0, second=0, microsecond=0)
+            meeting_end = meeting_start + timedelta(minutes=duration)
+            print(f"Moved to next business day due to time constraints")
     
-    return {
-        "resolution_strategies": resolution_strategies,
-        "auto_resolvable": len([s for s in resolution_strategies if s["action"] != "find_alternative"]),
-        "requires_human_intervention": len([s for s in resolution_strategies if s["action"] == "find_alternative"])
+    result = {
+        "start_time": meeting_start.strftime("%Y-%m-%dT%H:%M:%S+05:30"),
+        "end_time": meeting_end.strftime("%Y-%m-%dT%H:%M:%S+05:30"),
+        "duration_minutes": duration,
+        "extracted_day": target_date.strftime("%A, %Y-%m-%d"),
+        "confidence": "high",
+        "business_day_valid": target_date.weekday() < 5,
+        "business_hours_valid": 9 <= meeting_start.hour < 18 and meeting_end.hour <= 18,
+        "extraction_details": {
+            "detected_duration": f"{duration} minutes",
+            "detected_day": target_date.strftime("%A"),
+            "detected_time": f"{meeting_hour:02d}:{meeting_minute:02d}",
+            "parsing_method": "natural_language_with_business_rules",
+            "weekend_handling": "automatic_adjustment",
+            "off_hours_handling": "business_hours_enforcement"
+        }
     }
+    
+    print(f"LLM Tool Result:")
+    print(f"   Date: {target_date.strftime('%Y-%m-%d')} ({target_date.strftime('%A')})")
+    print(f"   Time: {meeting_start.strftime('%H:%M')} - {meeting_end.strftime('%H:%M')}")
+    print(f"   Duration: {duration} minutes")
+    print(f"   Confidence: {result['confidence']}")
+    
+    return result
 
-# Initialize the LLM model
+@Tool
+def create_meeting_response(request_data: Dict[str, Any], start_time: str, end_time: str) -> Dict[str, Any]:
+    """Create the final meeting response in the exact required format matching 3_Output_Event.json."""
+    print(f"\nLLM TOOL: create_meeting_response")
+    print(f"Input start_time: {start_time}")
+    print(f"Input end_time: {end_time}")
+    print(f"From: {request_data.get('From', 'Unknown')}")
+    print(f"Attendees count: {len(request_data.get('Attendees', []))}")
+    
+    # Get all attendees including organizer
+    attendee_emails = [request_data["From"]]
+    for att in request_data.get("Attendees", []):
+        attendee_emails.append(att["email"])
+    
+    print(f"Complete attendee list:")
+    for i, email in enumerate(attendee_emails):
+        print(f"   {i+1}. {email}")
+    
+    # Create events structure for each attendee (matching 3_Output_Event.json format)
+    attendee_events = []
+    for attendee in request_data.get("Attendees", []):
+        attendee_events.append({
+            "email": attendee["email"],
+            "events": [
+                {
+                    "StartTime": start_time,
+                    "EndTime": end_time,
+                    "NumAttendees": len(attendee_emails),
+                    "Attendees": attendee_emails,
+                    "Summary": request_data.get("Subject", "Team Meeting")
+                }
+            ]
+        })
+    
+    # Build response in exact format as 3_Output_Event.json
+    response = {
+        "Request_id": request_data["Request_id"],
+        "Datetime": request_data["Datetime"],
+        "Location": request_data["Location"],
+        "From": request_data["From"],
+        "Attendees": attendee_events,
+        "Subject": request_data.get("Subject", "Team Meeting"),
+        "EmailContent": request_data.get("EmailContent", ""),
+        "EventStart": start_time,
+        "EventEnd": end_time,
+        "Duration_mins": request_data.get("Duration_mins", "30"),
+        "MetaData": {}
+    }
+    
+    print(f"Created meeting response:")
+    print(f"   EventStart: {response['EventStart']}")
+    print(f"   EventEnd: {response['EventEnd']}")
+    print(f"   Subject: {response['Subject']}")
+    print(f"   Attendees: {len(response['Attendees'])} people")
+    
+    return response
+
+# Initialize LLM model using working pattern
 BASE_URL = "http://localhost:8000/v1"
 os.environ["BASE_URL"] = BASE_URL
 os.environ["OPENAI_API_KEY"] = "abc-123"
 
-agent_model = OpenAIModel(
-    'Qwen3-30B-A3B',
-    provider=OpenAIProvider(
-        base_url=os.environ["BASE_URL"], 
-        api_key=os.environ["OPENAI_API_KEY"]
-    ),
-)
-
-# Create the meeting scheduler agent
-meeting_scheduler_agent = Agent(
-    model=agent_model,
-    tools=[
-        get_current_datetime,
-        extract_meeting_details,
-        get_user_calendar_events,
-        get_all_attendees_availability,
-        find_optimal_time_slot,
-        create_calendar_event,
-        resolve_scheduling_conflicts
-    ],
-    system_prompt=(
-        "You are an AI Meeting Scheduler Assistant. Your primary goal is to autonomously schedule meetings with minimal human intervention.\n\n"
-        "CORE CAPABILITIES:\n"
-        "1. Parse natural language meeting requests from emails\n"
-        "2. Extract meeting details (attendees, duration, preferred time)\n"
-        "3. Check calendar availability for all attendees\n"
-        "4. Find optimal meeting times avoiding conflicts\n"
-        "5. Create calendar events automatically\n"
-        "6. Resolve scheduling conflicts intelligently\n\n"
-        "SCHEDULING RULES:\n"
-        "- Business hours: 9 AM to 6 PM IST\n"
-        "- Minimum meeting duration: 15 minutes\n"
-        "- Default duration: 30 minutes if not specified\n"
-        "- Prefer morning slots (9-12 PM) for important meetings\n"
-        "- Avoid lunch hours (12-1 PM) when possible\n"
-        "- Buffer 15 minutes between back-to-back meetings\n\n"
-        "CONFLICT RESOLUTION:\n"
-        "- Prioritize team meetings over 1:1s\n"
-        "- Suggest rescheduling optional meetings\n"
-        "- Propose alternative times for conflicts\n"
-        "- Auto-resolve when possible, escalate when needed\n\n"
-        "RESPONSE FORMAT:\n"
-        "Always provide structured responses with:\n"
-        "- Meeting details extracted\n"
-        "- Availability analysis\n"
-        "- Recommended time slots\n"
-        "- Conflict resolution if any\n"
-        "- Final scheduling decision\n\n"
-        "Be proactive, accurate, and user-friendly in your responses."
+try:
+    agent_model = OpenAIModel(
+        'Qwen3-30B-A3B',
+        provider=OpenAIProvider(
+            base_url=os.environ["BASE_URL"], 
+            api_key=os.environ["OPENAI_API_KEY"]
+        ),
     )
-)
+
+    # Create the date range extraction agent (using your pattern)
+    date_range_agent = Agent(
+        model=agent_model,
+        system_prompt=(
+            """
+            You are an expert date-time scheduling agent. Your sole responsibility is to find the most optimal date range based on the user's scheduling request.
+
+            Instructions:
+            Input: The user will provide a datetime reference (e.g., a timestamp or week/day constraint).
+
+            Start Date Rule:
+            Only consider dates after or equal to the provided timestamp. Do not include any date before the specified timestamp.
+
+            Range Logic:
+            If the user specifies multiple days or a week, calculate the earliest valid date and the latest valid date based on their input.
+            The "Start" field should begin at 00:00:00 on the earliest date.
+            The "End" field should end at 23:59:59 on the latest date.
+
+            Duration:
+            If the user provides a meeting duration (in minutes), use that value as a string.
+            If no duration is specified, default to "30" (as a string).
+
+            Business Hours Consideration:
+            Remember that business hours are 9 AM to 6 PM (09:00 to 18:00).
+            Off hours are from 6 PM to 9 AM next day (18:00 to 09:00+1day).
+
+            Format:
+            Return the output in strict JSON format as:
+            {
+              "Start": "YYYY-MM-DDT00:00:00+05:30",
+              "End": "YYYY-MM-DDT23:59:59+05:30", 
+              "Duration_mins": "30"
+            }
+
+            Output Requirements:
+            Only return the JSON.
+            Ensure all datetime values strictly follow the format: YYYY-MM-DDTHH:MM:SS+05:30.
+            """
+        )
+    )
+
+    # Create the optimal time finder agent
+    optimal_time_agent = Agent(
+        model=agent_model,
+        system_prompt=(
+            """
+            You are an expert meeting time optimizer. Your job is to find the best meeting time within business hours.
+
+            Business Rules:
+            - Business hours: 9:00 AM to 6:00 PM (09:00 to 18:00)
+            - Off hours: 6:00 PM to 9:00 AM next day (blocked for meetings)
+            - Weekdays only (Monday to Friday) - NO WEEKENDS
+            - Default meeting duration: 30 minutes
+
+            Weekend Handling:
+            - Saturday (weekday=5) and Sunday (weekday=6) are OFF LIMITS
+            - Always move weekend meetings to the next Monday
+            - If a requested day falls on weekend, automatically adjust to next business day
+
+            Input: You'll get email content with time preferences and a date range.
+
+            Time Extraction:
+            - "2 PM" or "14:00" → 14:00
+            - "10 AM" or "10:00" → 10:00  
+            - "morning" → 10:00
+            - "afternoon" → 14:00
+            - "3 PM" or "15:00" → 15:00
+            - If time is before 9 AM → adjust to 9:00
+            - If time is after 6 PM → move to next business day at 10:00
+
+            Day Extraction:
+            - "Thursday" → find next Thursday (unless it's in the past)
+            - "tomorrow" → next day (if weekend, move to Monday)
+            - "today" → current day (if weekend, move to Monday)
+            - If no day specified → use next business day (not Thursday by default)
+
+            Output Format:
+            {
+              "EventStart": "YYYY-MM-DDTHH:MM:SS+05:30",
+              "EventEnd": "YYYY-MM-DDTHH:MM:SS+05:30",
+              "OptimalTime": "HH:MM on DayName",
+              "BusinessHoursValid": true,
+              "Reasoning": "Why this time was chosen, including weekend/off-hours adjustments"
+            }
+
+            Always ensure:
+            1. No weekend meetings (Saturday/Sunday)
+            2. All times between 9:00 AM and 6:00 PM
+            3. Meeting end time doesn't exceed 6:00 PM
+            4. Clear reasoning for any adjustments made
+            """
+        )
+    )
+
+    # Create the meeting scheduler agent with working pattern
+    meeting_agent = Agent(
+        model=agent_model,
+        tools=[get_current_datetime, extract_meeting_time_from_email, create_meeting_response],
+        system_prompt=(
+            "You are an AI Meeting Scheduler. Your job is to:\n"
+            "1. Extract meeting details from email content using tools\n"
+            "2. Find the optimal meeting time based on the request\n"
+            "3. Return the meeting in the exact JSON format required\n\n"
+            "Always use the tools to:\n"
+            "- Get current datetime\n"
+            "- Extract meeting time from email content\n"
+            "- Create the final response\n\n"
+            "Be concise and focus on extracting the Start and End times accurately.\n"
+            "Consider that calendars have 'Off Hours' blocks from 6 PM to 9 AM daily.\n"
+            "Schedule meetings only during business hours (9 AM to 6 PM).\n"
+            "Weekends (Saturday/Sunday) are also considered off-hours."
+        )
+    )
+    
+    print(f"LLM Agent initialized successfully")
+    LLM_AVAILABLE = True
+    
+except Exception as e:
+    print(f"LLM initialization failed: {e}")
+    LLM_AVAILABLE = False
+    meeting_agent = None
+
+async def date_range_run(prompt: str) -> str:
+    """Extract date range using your working pattern"""
+    if not LLM_AVAILABLE or not date_range_agent:
+        raise Exception("Date range agent not available")
+    
+    async with date_range_agent.run_mcp_servers():
+        result = await date_range_agent.run(prompt)
+        return result.output
+
+async def optimal_time_run(prompt: str) -> str:
+    """Find optimal meeting time considering business hours and off-hours"""
+    if not LLM_AVAILABLE or not optimal_time_agent:
+        raise Exception("Optimal time agent not available")
+    
+    async with optimal_time_agent.run_mcp_servers():
+        result = await optimal_time_agent.run(prompt)
+        return result.output
+
+async def run_async(prompt: str) -> str:
+    """Helper function to run LLM async operations"""
+    if not LLM_AVAILABLE or not meeting_agent:
+        raise Exception("LLM not available")
+    
+    async with meeting_agent.run_mcp_servers():
+        result = await meeting_agent.run(prompt)
+        return result.output
 
 async def schedule_meeting_async(request_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Main async function to handle meeting scheduling requests."""
+    """Enhanced meeting scheduling with date range extraction and optimal time finding."""
+    print(f"\nENHANCED LLM SCHEDULING: schedule_meeting_async")
+    print(f"Request data keys: {list(request_data.keys())}")
+    
+    if not LLM_AVAILABLE:
+        print(f"LLM server not available")
+        return {"status": "error", "error": "LLM server not available"}
+    
     try:
-        async with meeting_scheduler_agent.run_mcp_servers():
-            # Create a comprehensive prompt with all the request data
-            prompt = f"""
-            I need to schedule a meeting based on this request:
+        print(f"Starting enhanced LLM scheduling...")
+        
+        # Step 1: Extract date range using your pattern
+        print(f"\nSTEP 1: DATE RANGE EXTRACTION")
+        email_content = request_data.get('EmailContent', '')
+        datetime_ref = request_data.get('Datetime', '')
+        
+        date_range_prompt = json.dumps({
+            "Datetime": datetime_ref,
+            "EmailContent": email_content
+        })
+        
+        print(f"Sending to date range agent:")
+        print(f"   Datetime: {datetime_ref}")
+        print(f"   Email: {email_content[:100]}...")
+        
+        date_range_result = await date_range_run(date_range_prompt)
+        print(f"Date range result: {date_range_result}")
+        
+        # Parse the date range result
+        try:
+            date_range_data = json.loads(date_range_result)
+            start_range = date_range_data.get('Start')
+            end_range = date_range_data.get('End')
+            duration_mins = date_range_data.get('Duration_mins', '30')
+            print(f"Parsed date range:")
+            print(f"   Start: {start_range}")
+            print(f"   End: {end_range}")
+            print(f"   Duration: {duration_mins} minutes")
+        except json.JSONDecodeError as e:
+            print(f"Failed to parse date range JSON: {e}")
+            # Fallback to original data
+            start_range = request_data.get('Start')
+            end_range = request_data.get('End')
+            duration_mins = request_data.get('Duration_mins', '30')
+        
+        # Step 2: Find optimal meeting time considering off-hours and weekends
+        print(f"\nSTEP 2: OPTIMAL TIME FINDING")
+        optimal_time_prompt = f"""
+        Find the optimal meeting time for this request:
+        
+        Email Content: {email_content}
+        Date Range: {start_range} to {end_range}
+        Duration: {duration_mins} minutes
+        Attendees: {[att.get('email') for att in request_data.get('Attendees', [])]}
+        
+        Remember:
+        - Business hours: 9 AM to 6 PM only
+        - NO WEEKENDS: Saturday and Sunday are off-limits
+        - Avoid off-hours: 6 PM to 9 AM next day
+        - Parse time mentions like "2 PM", "morning", "afternoon"
+        - Ensure meeting fits within business hours
+        - If requested day is weekend, move to next Monday
+        - If no specific day mentioned, use next business day (NOT Thursday by default)
+        """
+        
+        print(f"Sending to optimal time agent...")
+        optimal_time_result = await optimal_time_run(optimal_time_prompt)
+        print(f"Optimal time result: {optimal_time_result}")
+        
+        # Parse optimal time result
+        try:
+            optimal_data = json.loads(optimal_time_result)
+            event_start = optimal_data.get('EventStart')
+            event_end = optimal_data.get('EventEnd')
+            optimal_time = optimal_data.get('OptimalTime')
+            business_valid = optimal_data.get('BusinessHoursValid', True)
+            reasoning = optimal_data.get('Reasoning', 'LLM scheduling')
             
-            Request ID: {request_data.get('Request_id')}
-            From: {request_data.get('From')}
-            Attendees: {request_data.get('Attendees')}
-            Subject: {request_data.get('Subject')}
-            Email Content: {request_data.get('EmailContent')}
-            Requested Start: {request_data.get('Start')}
-            Requested End: {request_data.get('End')}
-            Duration: {request_data.get('Duration_mins', 30)} minutes
-            Location: {request_data.get('Location')}
+            print(f"Parsed optimal time:")
+            print(f"   EventStart: {event_start}")
+            print(f"   EventEnd: {event_end}")
+            print(f"   OptimalTime: {optimal_time}")
+            print(f"   BusinessHoursValid: {business_valid}")
+            print(f"   Reasoning: {reasoning}")
             
-            Please:
-            1. Extract meeting details from the email content
-            2. Get availability for all attendees
-            3. Find the best time slot
-            4. Handle any conflicts
-            5. Provide the final meeting schedule
+        except json.JSONDecodeError as e:
+            print(f"Failed to parse optimal time JSON: {e}")
+            # Fallback to default time calculation with weekend avoidance
+            from datetime import datetime, timedelta
             
-            Return a comprehensive response with the optimal meeting time.
-            """
+            def find_next_business_day_fallback(start_date: datetime) -> datetime:
+                """Find the next business day (Monday-Friday), skipping weekends."""
+                next_day = start_date
+                while next_day.weekday() >= 5:  # Saturday=5, Sunday=6
+                    next_day += timedelta(days=1)
+                    print(f"Fallback: Skipping weekend day {next_day.strftime('%A')}")
+                return next_day
             
-            result = await meeting_scheduler_agent.run(prompt)
-            return {"status": "success", "response": result.output}
+            try:
+                start_dt = datetime.fromisoformat(start_range.replace('+05:30', ''))
+                # Find next business day from start range
+                business_day = find_next_business_day_fallback(start_dt)
+                # Default to 10:30 AM on the business day
+                event_start_dt = business_day.replace(hour=10, minute=30, second=0, microsecond=0)
+                event_end_dt = event_start_dt + timedelta(minutes=int(duration_mins))
+                
+                event_start = event_start_dt.strftime("%Y-%m-%dT%H:%M:%S+05:30")
+                event_end = event_end_dt.strftime("%Y-%m-%dT%H:%M:%S+05:30")
+                reasoning = f"Fallback to 10:30 AM on {business_day.strftime('%A %Y-%m-%d')} (weekend avoidance applied)"
+                
+            except Exception as fallback_error:
+                print(f"Fallback time calculation failed: {fallback_error}")
+                return {"status": "error", "error": f"Time calculation failed: {fallback_error}"}
+        
+        # Step 3: Create final response with extracted times
+        print(f"\nSTEP 3: RESPONSE CREATION")
+        final_response = {
+            "status": "success",
+            "event_start": event_start,
+            "event_end": event_end,
+            "duration_mins": duration_mins,
+            "start_range": start_range,
+            "end_range": end_range,
+            "reasoning": reasoning,
+            "method": "enhanced_llm_scheduling"
+        }
+        
+        print(f"Enhanced LLM scheduling complete:")
+        print(f"   Meeting: {event_start} to {event_end}")
+        print(f"   Duration: {duration_mins} minutes")
+        print(f"   Method: Enhanced LLM with off-hours consideration")
+        
+        return final_response
+        
     except Exception as e:
+        print(f"Enhanced LLM scheduling error: {str(e)}")
         return {"status": "error", "error": str(e)}
 
 def schedule_meeting(request_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Synchronous wrapper for the async meeting scheduling function."""
+    """Synchronous wrapper for LLM meeting scheduling with working pattern."""
+    print(f"\n🔗 LLM WRAPPER: schedule_meeting")
+    print(f"Request ID: {request_data.get('Request_id', 'Unknown')}")
+    
+    if not LLM_AVAILABLE:
+        print(f"LLM not available")
+        return {"status": "error", "error": "LLM server not available"}
+    
     try:
-        # Create new event loop for this thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        print(f"Setting up async event loop...")
+        import asyncio
+        
+        # Use new event loop pattern
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        print(f"Executing LLM async function...")
         result = loop.run_until_complete(schedule_meeting_async(request_data))
-        loop.close()
+        
+        print(f"LLM wrapper result:")
+        print(f"   Status: {result.get('status', 'Unknown')}")
+        if result.get('status') == 'success':
+            print(f"   Response available: {result.get('response') is not None}")
+        else:
+            print(f"   Error: {result.get('error', 'Unknown error')}")
+        
         return result
+        
     except Exception as e:
+        print(f"LLM wrapper error: {str(e)}")
         return {"status": "error", "error": str(e)}

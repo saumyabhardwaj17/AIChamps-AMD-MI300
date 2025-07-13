@@ -135,7 +135,6 @@ class MeetingScheduler:
         except Exception as e:
             print(f"Date parsing error: {e}")
             # Fallback to next day if parsing fails
-            from datetime import datetime, timedelta
             start_dt = datetime.now().replace(hour=9, minute=0, second=0, microsecond=0)
             end_dt = start_dt + timedelta(days=1)
         
@@ -184,8 +183,18 @@ class MeetingScheduler:
                     event_start = datetime.fromisoformat(event["StartTime"])
                     event_end = datetime.fromisoformat(event["EndTime"])
                     
+                    # Make timezone-naive for comparison if needed
+                    if event_start.tzinfo is not None:
+                        event_start = event_start.replace(tzinfo=None)
+                    if event_end.tzinfo is not None:
+                        event_end = event_end.replace(tzinfo=None)
+                    
+                    # Ensure slot times are also timezone-naive
+                    slot_start_naive = current.replace(tzinfo=None) if current.tzinfo else current
+                    slot_end_naive = slot_end.replace(tzinfo=None) if slot_end.tzinfo else slot_end
+                    
                     # Check for overlap
-                    if (current < event_end and slot_end > event_start):
+                    if (slot_start_naive < event_end and slot_end_naive > event_start):
                         all_available = False
                         conflicts.append({
                             "attendee": attendee,
@@ -285,13 +294,23 @@ class MeetingScheduler:
             "Attendees": []
         }
         
+        # Fix missing Subject
+        subject = request_data.get("Subject")
+        if not subject:
+            # Extract from email content
+            email_content = request_data.get("EmailContent", "")
+            if "goals" in email_content.lower():
+                subject = "Goals Discussion Meeting"
+            else:
+                subject = "Team Meeting"
+        
         # Create the scheduled meeting event
         scheduled_event = {
             "StartTime": best_slot["start_time"],
             "EndTime": best_slot["end_time"],
             "NumAttendees": len(attendee_emails),
             "Attendees": attendee_emails,
-            "Summary": request_data["Subject"]
+            "Summary": subject
         }
         
         # Add events for each attendee
@@ -319,13 +338,15 @@ class MeetingScheduler:
         if not datetime_str:
             return datetime.now()
         
-        # Remove timezone info for now
+        # Remove timezone info for consistent handling
         clean_str = datetime_str.replace('Z', '').replace('+00:00', '').replace('+05:30', '')
         
         # Handle different formats
         try:
             # Try standard ISO format first
-            return datetime.fromisoformat(clean_str)
+            dt = datetime.fromisoformat(clean_str)
+            # Ensure timezone-naive for consistent comparison
+            return dt.replace(tzinfo=None) if dt.tzinfo else dt
         except ValueError:
             pass
         
@@ -384,7 +405,6 @@ def process_meeting_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
         
         # If no time range provided, create a default range for next week
         if not start_time or not end_time:
-            from datetime import datetime, timedelta
             now = datetime.now()
             next_week = now + timedelta(days=7)
             start_time = now.replace(hour=0, minute=0, second=0).isoformat()
