@@ -1,0 +1,25 @@
+# AI Meeting Scheduler Requirements
+# Core Flask and API requirements
+flask==2.3.3
+requests==2.31.0
+
+# Google Calendar integration
+google-auth==2.23.3
+google-auth-oauthlib==1.1.0
+google-auth-httplib2==0.1.1
+google-api-python-client==2.103.0
+
+# LLM and AI agent requirements  
+pydantic-ai==0.0.14
+pydantic==2.5.0
+openai==1.3.0
+
+# Date/time handling
+pytz==2023.3
+
+# Data processing
+python-dateutil==2.8.2
+
+# Development and testing
+pytest==7.4.2
+python-dotenv==1.0.0
